@@ -1,0 +1,18 @@
+# 桥接服务（部署九章 /opt/homy/bridge/）。mosquitto 已单独部署 /opt/homy/mosquitto，
+# 本 compose 只定义桥接，加入 mosquitto_default 网络直连容器。
+# 镜像由本机构建推送远端 daemon：docker -H tcp://<九章>:2345 build -t homy-bridge:latest .
+services:
+  bridge:
+    image: homy-bridge:latest
+    container_name: homy-bridge
+    restart: unless-stopped
+    env_file: .env
+    networks: [mosquitto]
+    volumes:
+      # token 持久化：重启容器不重登（~/.homycloud/token.json）
+      - ./data:/root/.homycloud
+
+networks:
+  mosquitto:
+    external: true
+    name: mosquitto_default

@@ -1,0 +1,8 @@
+# 构建上下文瘦身：代码 + certs 以外的都不进镜像/不上传远端 daemon
+__pycache__/
+docs/
+data/
+.env
+.env.example
+*.md
+.gitignore

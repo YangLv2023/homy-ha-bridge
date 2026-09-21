@@ -1,0 +1,12 @@
+# 敏感信息（项目铁律 2）
+.env
+token.json
+*.token
+data/
+
+# 内部文档（含脱敏后的历史凭据与运行环境细节，不上传公开仓库）
+docs/
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,13 @@
+{
+  "_comment": "真实设备 ID 与命名定案（随仓库上传：当前真实配置即克隆者模板，设备 ID 单独泄露无法控制设备——2026-09-21 用户定案，见 docs/脱敏记录.md）。name_overrides 与 APP houseName 不一致时以此为准（2026-09-20 用户拍板）",
+  "gateway_device_id": "411323c2ada7480abadbca061105538a5",
+  "probe_hvac_device_id": "4e050a8114cf41309542e9617a5e64185",
+  "name_overrides": {
+    "4e050a8114cf41309542e9617a5e64185": {"room": "餐厅", "name": "餐厅暖通"},
+    "422e9dd88964494988adb04cae1921ef5": {"room": "书房", "name": "书房暖通"},
+    "e26bc8b72af247979f3a7772b899806c5": {"room": "客厅", "name": "客厅暖通#1"},
+    "1b807d002bb24a709177a4d57003e0105": {"room": "主卧", "name": "主卧暖通"},
+    "cc4e69ecc1b84ff4866fae8afb6fc6b25": {"room": "次卧", "name": "次卧暖通"},
+    "39d3b51c60004c9b8c30830f2a5fdeb85": {"room": "老人房", "name": "老人房暖通"}
+  }
+}
