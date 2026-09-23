@@ -1,5 +1,5 @@
 {
-  "_comment": "真实设备 ID 与命名定案（随仓库上传：当前真实配置即克隆者模板，设备 ID 单独泄露无法控制设备——2026-09-21 用户定案，见 docs/脱敏记录.md）。name_overrides 与 APP houseName 不一致时以此为准（2026-09-20 用户拍板）",
+  "_comment": "真实设备 ID 与命名定案（随仓库上传：当前真实配置即克隆者模板，设备 ID 单独泄露无法控制设备——2026-09-21 用户定案，见 docs/脱敏记录.md）。name_overrides 与 APP houseName 不一致时以此为准（2026-09-20 用户拍板）。channels=面板键位→HA 实体（2026-09-22 用户逐键实测+命名确认）：name=HA 实体显示名（除唯一实例外一律带区域前缀）、area=实体归属区域（缺省=面板所在房间，灯与面板不同屋时显式给出）、platform 缺省 light。联动组只由 _linked_primary 面板出实体（客厅组主=affa、主卧组主=d3ab，2026-09-22 用户指定），mirror 面板不出。网关 CGW0001 不出实体。HA 设备/区域/灯组规划见 docs/HA实体映射定义.md",
   "gateway_device_id": "411323c2ada7480abadbca061105538a5",
   "probe_hvac_device_id": "4e050a8114cf41309542e9617a5e64185",
   "name_overrides": {
@@ -8,6 +8,58 @@
     "e26bc8b72af247979f3a7772b899806c5": {"room": "客厅", "name": "客厅暖通#1"},
     "1b807d002bb24a709177a4d57003e0105": {"room": "主卧", "name": "主卧暖通"},
     "cc4e69ecc1b84ff4866fae8afb6fc6b25": {"room": "次卧", "name": "次卧暖通"},
-    "39d3b51c60004c9b8c30830f2a5fdeb85": {"room": "老人房", "name": "老人房暖通"}
+    "39d3b51c60004c9b8c30830f2a5fdeb85": {"room": "老人房", "name": "老人房暖通"},
+    "4e860d8890b74e4b95589e513c1819155": {"room": "客厅", "name": "客厅面板"},
+    "b23cedc19922424a929e67731166c3935": {"room": "厨房", "name": "厨房面板"},
+    "affa6b4d259e46d6b53bbd916ffa5f065": {"room": "过道", "name": "过道面板（客厅组主）"},
+    "eb9cdbc7ecc149778698c00c4120931e5": {"room": "客卫", "name": "客卫面板（APP 误标过道）"},
+    "3795faa684e546459490c462c64910395": {"room": "玄关", "name": "玄关灯"},
+    "d3ab71a720bd48b1bc60ebc4b9826db65": {"room": "主卧", "name": "主卧门边面板（主卧组主）"},
+    "948625963ab34de481c57fa344b614cd5": {"room": "主卧", "name": "主卧床头面板（联动镜像）"},
+    "aa0543672c6642e986f3f1cc624cae835": {"room": "主卫", "name": "主卫面板（APP 误标主卧）"}
+  },
+  "channels": {
+    "4e860d8890b74e4b95589e513c1819155": {
+      "_mirror_only": true, "_linked_with": "affa6b4d259e46d6b53bbd916ffa5f065",
+      "_keys": {"switch_1": "客厅灯带", "switch_2": "磁吸灯", "switch_3": "餐厅主灯", "switch_4": "电视墙灯"}
+    },
+    "affa6b4d259e46d6b53bbd916ffa5f065": {
+      "_linked_primary": true,
+      "switch_1": {"name": "客厅灯带", "area": "客厅"},
+      "switch_2": {"name": "客厅磁吸灯", "area": "客厅"},
+      "switch_3": {"name": "餐厅主灯", "area": "餐厅"},
+      "switch_4": {"name": "客厅电视墙灯", "area": "客厅"}
+    },
+    "b23cedc19922424a929e67731166c3935": {
+      "switch_1": {"name": "阳台灯", "area": "阳台"},
+      "switch_2": {"name": "厨房灯带", "area": "厨房"},
+      "switch_3": {"name": "厨房射灯", "area": "厨房"},
+      "switch_4": {"name": "凉霸", "area": "厨房", "platform": "fan"}
+    },
+    "eb9cdbc7ecc149778698c00c4120931e5": {
+      "switch_1": {"name": "客卫浴室灯"},
+      "switch_2": {"name": "客卫盥洗灯"},
+      "switch_3": {"name": "客卫柜镜灯"}
+    },
+    "3795faa684e546459490c462c64910395": {
+      "switch_1": {"name": "玄关灯"},
+      "_note": "唯一键未在干净窗口单独复验，基本可定"
+    },
+    "d3ab71a720bd48b1bc60ebc4b9826db65": {
+      "_linked_primary": true,
+      "switch_1": {"name": "主卧走廊灯"},
+      "switch_2": {"name": "主卧灯带"},
+      "switch_3": {"name": "主卧射灯"},
+      "switch_4": {"name": "主卧床头灯"}
+    },
+    "948625963ab34de481c57fa344b614cd5": {
+      "_mirror_only": true, "_linked_with": "d3ab71a720bd48b1bc60ebc4b9826db65",
+      "_keys": {"switch_1": "走廊灯", "switch_2": "灯带", "switch_3": "射灯", "switch_4": "床头灯"}
+    },
+    "aa0543672c6642e986f3f1cc624cae835": {
+      "switch_1": {"name": "主卫浴室灯"},
+      "switch_2": {"name": "主卫盥洗灯"},
+      "switch_3": {"name": "主卫柜镜灯"}
+    }
   }
 }

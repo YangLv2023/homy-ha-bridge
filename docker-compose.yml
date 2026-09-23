@@ -1,18 +1,59 @@
-# 桥接服务（部署九章 /opt/homy/bridge/）。mosquitto 已单独部署 /opt/homy/mosquitto，
-# 本 compose 只定义桥接，加入 mosquitto_default 网络直连容器。
+# 宏云 → HA 桥接一套（部署九章 /opt/homy/bridge/）：mosquitto + bridge 同一 compose。
+# 网络沿用外部 mosquitto_default（HA 容器已在该网络上、按容器名 homy-mosquitto 连接），
+# 故 external: true 由 compose 引用而不创建/删除它。
+# **broker 凭据唯一事实源 = 本目录 .env**：mosquitto 启动时用 MQTT_USER/MQTT_PASS 现场生成
+# passwd 文件，改完 .env 重新 `compose up -d` 即对 broker+桥接生效（HA 里的密码需另改一次）。
 # 镜像由本机构建推送远端 daemon：docker -H tcp://<九章>:2345 build -t homy-bridge:latest .
 services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    # 容器名即 broker 地址（bridge / HA 都按 homy-mosquitto 连），改名会导致两侧同时断连
+    container_name: homy-mosquitto
+    restart: unless-stopped
+    # :? = .env 缺这两个键就直接拒绝启动（防止误起一个无认证的公网 broker）
+    environment:
+      MQTT_USER: ${MQTT_USER:?MQTT_USER 必填}
+      MQTT_PASS: ${MQTT_PASS:?MQTT_PASS 必填}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        rm -f /mosquitto/data/passwd
+        mosquitto_passwd -c -b /mosquitto/data/passwd "$$MQTT_USER" "$$MQTT_PASS"
+        # 全新机器上 docker 把挂载目录建成 root 属主，而 broker 掉权到 mosquitto(1883)：
+        # 不递归 chown 则日志写不出（Unable to open log file）且 mosquitto.db 不落盘（retained 重启即丢）
+        chown -R mosquitto:mosquitto /mosquitto/data /mosquitto/log
+        chmod 600 /mosquitto/data/passwd
+        exec mosquitto -c /mosquitto/config/mosquitto.conf
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    networks: [homy]
+
   bridge:
+    build: .
     image: homy-bridge:latest
     container_name: homy-bridge
     restart: unless-stopped
+    depends_on: [mosquitto]
     env_file: .env
-    networks: [mosquitto]
+    # 显式插值：env_file 内容变更不一定触发 compose 重建，这两行保证改密码后桥接必被重建
+    environment:
+      MQTT_USER: ${MQTT_USER:?MQTT_USER 必填}
+      MQTT_PASS: ${MQTT_PASS:?MQTT_PASS 必填}
+      # 容器默认 UTC，日志比北京时间早 8 小时；TZ 需镜像有 tzdata（python:3.12-slim 有）
+      TZ: Asia/Shanghai
+      # 不关缓冲，docker logs 不再晚几秒
+      PYTHONUNBUFFERED: "1"
+    networks: [homy]
     volumes:
       # token 持久化：重启容器不重登（~/.homycloud/token.json）
       - ./data:/root/.homycloud
 
 networks:
-  mosquitto:
+  homy:
     external: true
     name: mosquitto_default

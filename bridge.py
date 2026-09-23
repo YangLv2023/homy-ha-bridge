@@ -24,15 +24,17 @@ import threading
 import time
 from pathlib import Path
 
+import httpx
 import paho.mqtt.client as mqtt
 
-from homycloud import HomyCloudClient
+from homycloud import HomyCloudClient, HomyCloudError
 from honymqtt import HomyMqttClient
+import hadiscovery
 
 logger = logging.getLogger("bridge")
 
 LOCAL_STATE_TOPIC = "homy/state/{device_id}"
-LOCAL_CMD_TOPIC = "homy/cmd/+"          # HA → 桥接：{"switch": true} / {"temp_set": 26.5}
+LOCAL_CMD_TOPIC = "homy/cmd/#"          # HA → 桥接：homy/cmd/{did} 整 JSON 或 homy/cmd/{did}/{suffix} 平台命令（S8-2）
 
 # 温度必须 JSON number（S7-a 实测：字符串值被设备静默忽略）——这里兜底归一
 TEMP_FIELDS = {"temp_set", "heating_temp_set_c"}
@@ -49,6 +51,10 @@ PULL_FAIL_THRESHOLD = 3
 # 间隔可经 .env TOKEN_HEARTBEAT_SECONDS（秒）调整，默认 600
 TOKEN_HEARTBEAT_SECONDS_DEFAULT = 600.0
 
+# 云端启动阶段（登录/查家庭/初始快照）失败后的原地重试间隔。默认 5 分钟——风控期
+# 里最忌秒级重来（抛出异常被 compose 拉起就是秒级），间隔经 .env CLOUD_RETRY_SECONDS 调
+CLOUD_RETRY_SECONDS_DEFAULT = 300.0
+
 # 项目命名定案（2026-09-20 用户拍板）：与 APP houseName 不一致处以 devices.json 为准
 # devices.json 含真实设备 ID（随仓库上传，作克隆模板），缺失时回退用 APP 返回的房间/设备名
 def load_devices_config() -> dict:
@@ -64,7 +70,7 @@ NAME_OVERRIDES = DEVICES_CONFIG.get("name_overrides", {})
 
 ENV_KEYS = ("PHONE", "PASSWORD", "FAMILY_NAME",
             "LOCAL_MQTT_HOST", "LOCAL_MQTT_PORT", "TOKEN_HEARTBEAT_SECONDS",
-            "MQTT_USER", "MQTT_PASS")
+            "CLOUD_RETRY_SECONDS", "MQTT_USER", "MQTT_PASS")
 
 
 def load_env() -> dict:
@@ -81,6 +87,14 @@ def load_env() -> dict:
         if os.environ.get(k):
             env[k] = os.environ[k]
     return env
+
+
+def _env_float(env: dict, key: str, default: float) -> float:
+    try:
+        return float(env.get(key, default))
+    except (TypeError, ValueError):
+        logger.warning("%s 配置非法，使用默认 %.0fs", key, default)
+        return default
 
 
 class LocalMqtt:
@@ -133,6 +147,9 @@ class LocalMqtt:
         )
 
     def _on_connect(self, client, userdata, flags, rc):
+        if rc != 0:
+            logger.error("本地 MQTT CONNACK 失败 rc=%s（账号或密码错误，检查 MQTT_USER/MQTT_PASS）", rc)
+            return
         logger.info("本地 MQTT 已连接 %s:%s", self._host, self._port)
         self._connected.set()
         client.subscribe(LOCAL_CMD_TOPIC, qos=0)
@@ -140,13 +157,13 @@ class LocalMqtt:
     def _on_message(self, client, userdata, msg):
         if self._on_command_cb is None or not msg.topic.startswith("homy/cmd/"):
             return
+        raw = msg.payload.decode("utf-8", "replace")
         try:
-            payload = json.loads(msg.payload.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            logger.warning("本地命令 payload 非 JSON，忽略: %s", msg.topic)
-            return
+            payload = json.loads(raw)
+        except ValueError:
+            payload = None  # 平台命令（如 light 的裸 "ON"）非 JSON，原样透传
         try:
-            self._on_command_cb(msg.topic, payload)
+            self._on_command_cb(msg.topic, payload, raw)
         except Exception:
             logger.exception("命令处理异常: %s", msg.topic)
 
@@ -416,35 +433,141 @@ class Bridge:
                 logger.info("在线列表更新: %d 台在线", len(ids))
                 self.publish_all()
 
-    # ---------- 控制下行（S7-6）----------
-    def on_local_command(self, topic: str, payload: dict) -> None:
-        """homy/cmd/{deviceId} {"field": value, ...} → 逐字段云端 set（5.5 单字段逐发）。"""
-        if not isinstance(payload, dict) or not payload:
-            logger.warning("命令 payload 需为非空 JSON 对象，忽略: %s", topic)
+    # ---------- 控制下行（S7-6 / S8-2 平台命令）----------
+    _ONOFF = {"on": True, "off": False}
+
+    def on_local_command(self, topic: str, payload, raw: str | None = None) -> None:
+        """统一命令入口：
+        homy/cmd/{deviceId}            → JSON {field: value, ...}（手工调试/兼容 S7-6）
+        homy/cmd/{deviceId}/{suffix}   → HA 平台命令（discovery 约定，见 docs/HA实体映射定义.md）
+        """
+        parts = topic.split("/")
+        device_id = parts[2] if len(parts) > 2 else ""
+        if not device_id or self.state.meta(device_id) is None:
+            logger.warning("命令目标设备未注册，忽略: %s", topic)
             return
-        device_id = topic.split("/")[-1]
-        if self.state.meta(device_id) is None:
-            logger.warning("命令目标设备未注册，忽略: %s", device_id)
-            return
-        for field, value in payload.items():
-            if field in TEMP_FIELDS:
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
-                    logger.warning("命令 %s.%s 温度值非法（需数字）: %r，忽略", device_id[:8], field, value)
-                    continue
-            if self.dry_run:
-                logger.info("[dry-run] set %s: %s=%r", device_id[:8], field, value)
-                continue
+        if len(parts) == 3:
+            if not isinstance(payload, dict) or not payload:
+                logger.warning("命令 payload 需为非空 JSON 对象，忽略: %s", topic)
+                return
+            for field, value in payload.items():
+                self._send_field(device_id, field, value)
+        elif len(parts) == 4:
+            self._platform_command(device_id, parts[3], payload if payload is not None else raw)
+        else:
+            logger.warning("命令主题层级非法，忽略: %s", topic)
+
+    def _send_field(self, device_id: str, field: str, value) -> None:
+        """单字段云端 set（5.5：newdevReport、单字段逐发；温度必须 number 并排程校准）。"""
+        if field in TEMP_FIELDS:
             try:
-                sent = self.cloud_mqtt.publish_set(device_id, {field: value}, self.family_uuid)
-                logger.info("已下发 set %s: %s=%r (msgId=%s)", device_id[:8], field, value, sent["msgId"])
-                if field in TEMP_FIELDS and self.temp_puller:
-                    # 决策 #17（用户修订）：温度 set 无可靠回推，30s/60s 后拉 property/last 校准；
-                    # 其余字段 view 回推准确快速，无需再拉
-                    self.temp_puller.request(device_id)
-            except Exception as e:
-                logger.error("下发失败 %s.%s: %s", device_id[:8], field, e)
+                value = float(value)
+            except (TypeError, ValueError):
+                logger.warning("命令 %s.%s 温度值非法（需数字）: %r，忽略", device_id[:8], field, value)
+                return
+        if self.dry_run:
+            logger.info("[dry-run] set %s: %s=%r", device_id[:8], field, value)
+            return
+        try:
+            sent = self.cloud_mqtt.publish_set(device_id, {field: value}, self.family_uuid)
+            logger.info("已下发 set %s: %s=%r (msgId=%s)", device_id[:8], field, value, sent["msgId"])
+            if field in TEMP_FIELDS and self.temp_puller:
+                # 决策 #17（用户修订）：温度 set 无可靠回推，30s/60s 后拉 property/last 校准
+                self.temp_puller.request(device_id)
+        except Exception as e:
+            logger.error("下发失败 %s.%s: %s", device_id[:8], field, e)
+
+    def _platform_command(self, device_id: str, suffix: str, payload) -> None:
+        """HA 平台命令 → 云端字段映射（docs/HA实体映射定义.md 第三节）。"""
+        def onoff(v):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return self._ONOFF.get(v.strip().lower())
+            return None
+
+        try:
+            if suffix.startswith(("light_", "fan_")):
+                n = int(suffix.rsplit("_", 1)[1])
+                flag = onoff(payload)
+                if flag is None:
+                    logger.warning("灯/fan 命令需 ON/OFF，忽略: %s %r", suffix, payload)
+                    return
+                self._send_field(device_id, f"switch_{n}", flag)
+            elif suffix == "air":
+                # 新风 fan：JSON {"state":"ON","preset_mode":"low"} / 裸 ON/OFF / 风速串
+                if isinstance(payload, dict):
+                    flag = onoff(payload.get("state")) if payload.get("state") is not None else None
+                    if flag is not None:
+                        self._send_field(device_id, "switch_air", flag)
+                    pm = payload.get("preset_mode") or payload.get("speed")
+                    if pm:
+                        self._send_field(device_id, "fan_speed_enum", str(pm).lower())
+                elif onoff(payload) is not None:
+                    self._send_field(device_id, "switch_air", onoff(payload))
+                elif str(payload).strip().lower() in ("low", "middle", "high"):
+                    self._send_field(device_id, "fan_speed_enum", str(payload).strip().lower())
+                else:
+                    logger.warning("新风命令无法识别，忽略: %r", payload)
+            elif suffix in ("hvac_ac", "hvac_heat"):
+                if not isinstance(payload, dict):
+                    logger.warning("climate 命令需 JSON，忽略: %s %r", suffix, payload)
+                    return
+                if suffix == "hvac_ac":
+                    mode = payload.get("hvac_mode") or payload.get("mode")
+                    if mode:
+                        m = str(mode).strip().lower()
+                        if m == "off":
+                            self._send_field(device_id, "switch", False)
+                        else:
+                            mapped = hadiscovery.HVAC_MODE_IN.get(m)
+                            if mapped:
+                                # 界面切到制冷/制热等模式 = 期望开机并切模式
+                                self._send_field(device_id, "switch", True)
+                                self._send_field(device_id, "mode", mapped)
+                            else:
+                                logger.warning("空调 mode 无法映射，忽略: %r", mode)
+                    fm = payload.get("fan_mode")
+                    if fm:
+                        self._send_field(device_id, "level", str(fm).strip().lower())
+                else:
+                    mode = payload.get("hvac_mode") or payload.get("mode")
+                    if mode:
+                        m = str(mode).strip().lower()
+                        if m == "off":
+                            self._send_field(device_id, "switch_heating", False)
+                        elif m == "heat":
+                            self._send_field(device_id, "switch_heating", True)
+                        else:
+                            logger.warning("地暖仅支持 off/heat，忽略: %r", mode)
+                    else:
+                        flag = onoff(payload.get("state"))
+                        if flag is not None:
+                            self._send_field(device_id, "switch_heating", flag)
+                temp = payload.get("temperature")
+                if temp is not None:
+                    field = "temp_set" if suffix == "hvac_ac" else "heating_temp_set_c"
+                    self._send_field(device_id, field, temp)
+            else:
+                logger.warning("未知命令后缀，忽略: %s", suffix)
+        except Exception:
+            logger.exception("平台命令处理异常: %s %s", device_id[:8], suffix)
+
+    # ---------- HA discovery（S8-2）----------
+    def publish_discovery(self) -> None:
+        channels = DEVICES_CONFIG.get("channels", {})
+        metas = {did: (self.state.meta(did) or {}) for did in self.state.device_ids()}
+        configs = hadiscovery.build_configs(metas, channels)
+        if self.dry_run:
+            by_platform: dict[str, int] = {}
+            for topic, _ in configs:
+                plat = topic.split("/")[1]
+                by_platform[plat] = by_platform.get(plat, 0) + 1
+            logger.info("[dry-run] discovery 共 %d 条: %s", len(configs), by_platform)
+            return
+        for topic, payload in configs:
+            self.local.publish(topic, payload, retain=True)
+        logger.info("discovery 已发布 %d 条（retained）", len(configs))
 
 
 def main() -> None:
@@ -455,24 +578,43 @@ def main() -> None:
     env = load_env()
 
     cloud = HomyCloudClient(env["PHONE"], env["PASSWORD"])
-    cloud.login()
-    logger.info("云端登录 OK（user=%s）", cloud.user_uuid)
 
-    # 家庭信息运行时解析：.env 只配 FAMILY_NAME，uuid/clientId 从 family/simple 现查
-    families = cloud.list_families() or []
-    target = next((f for f in families if f.get("familyName") == env["FAMILY_NAME"]), None)
-    if target is None:
-        logger.error(
-            "家庭 %r 不在账号家庭列表中（现有: %s），退出",
-            env["FAMILY_NAME"], [f.get("familyName") for f in families],
-        )
-        sys.exit(1)
-    family_uuid = target["familyUuid"]
-    family_client_id = target["clientId"]
-    logger.info("目标家庭: %s (uuid=%s, clientId=%s)", env["FAMILY_NAME"], family_uuid, family_client_id)
-
+    # 启动阶段（登录→查家庭→拉初始快照）绝不能抛出去：抛出 = compose 秒级拉起
+    # = 每秒一次云端请求，正是把账号推进风控的形态（2026-09-22 实测 RestartCount=9）。
+    retry_seconds = _env_float(env, "CLOUD_RETRY_SECONDS", CLOUD_RETRY_SECONDS_DEFAULT)
     state = BridgeState()
-    build_initial_snapshot(cloud, state, family_uuid)
+    while True:
+        try:
+            cloud.login()
+            logger.info("云端登录 OK（user=%s）", cloud.user_uuid)
+
+            # 家庭信息运行时解析：.env 只配 FAMILY_NAME，uuid/clientId 从 family/simple 现查
+            families = cloud.list_families() or []
+            target = next(
+                (f for f in families if f.get("familyName") == env["FAMILY_NAME"]), None
+            )
+            if target is None:
+                logger.error(
+                    "家庭 %r 不在账号家庭列表中（现有: %s），退出",
+                    env["FAMILY_NAME"], [f.get("familyName") for f in families],
+                )
+                sys.exit(1)
+            family_uuid = target["familyUuid"]
+            family_client_id = target["clientId"]
+            logger.info(
+                "目标家庭: %s (uuid=%s, clientId=%s)",
+                env["FAMILY_NAME"], family_uuid, family_client_id,
+            )
+
+            build_initial_snapshot(cloud, state, family_uuid)
+            break
+        except (HomyCloudError, httpx.HTTPError, OSError) as e:
+            logger.error(
+                "云端启动阶段失败（%s: %s）→ %.0fs 后原地重试，不退出",
+                type(e).__name__, e, retry_seconds,
+            )
+            time.sleep(retry_seconds)
+
     logger.info("初始快照完成，共 %d 台：\n%s", len(state.device_ids()), state.summary())
 
     local = LocalMqtt(
@@ -489,23 +631,30 @@ def main() -> None:
         sys.exit(1)
 
     bridge.family_uuid = family_uuid
-    creds = cloud.build_mqtt_credentials(family_uuid, family_client_id)
-    mqtt_cli = HomyMqttClient(creds, on_message=bridge.on_cloud_message)
+
+    def build_creds():
+        return cloud.build_mqtt_credentials(family_uuid, family_client_id)
+
+    mqtt_cli = HomyMqttClient(
+        build_creds(),
+        on_message=bridge.on_cloud_message,
+        creds_provider=build_creds,
+    )
     bridge.cloud_mqtt = mqtt_cli
     mqtt_cli.start()
     if not mqtt_cli.wait_ready(timeout=30):
-        logger.error("云端 MQTT 30s 未建连，退出")
-        sys.exit(1)
+        # S8-5：这里绝不能退出——退出遇上 restart=unless-stopped 会在软限流期
+        # 变成每 30s 一次全新建连的重启风暴，把 honymqtt 的退避阶梯绕开、反喂限流。
+        logger.warning("云端 MQTT 30s 未建连，保持运行，交由 honymqtt 退避阶梯后台重连")
 
     bridge.publish_all()
-    logger.info("桥接就绪：初始状态已发布本地（homy/state/#，retained）")
+    bridge.publish_discovery()
+    logger.info("桥接就绪：初始状态已发布本地（homy/state/#，retained）+ discovery 已发（homeassistant/#，retained）")
 
     stop_event = threading.Event()
-    try:
-        heartbeat_interval = float(env.get("TOKEN_HEARTBEAT_SECONDS", TOKEN_HEARTBEAT_SECONDS_DEFAULT))
-    except ValueError:
-        logger.warning("TOKEN_HEARTBEAT_SECONDS 配置非法，使用默认 %.0fs", TOKEN_HEARTBEAT_SECONDS_DEFAULT)
-        heartbeat_interval = TOKEN_HEARTBEAT_SECONDS_DEFAULT
+    heartbeat_interval = _env_float(
+        env, "TOKEN_HEARTBEAT_SECONDS", TOKEN_HEARTBEAT_SECONDS_DEFAULT
+    )
     logger.info("心跳间隔 %.0fs（.env TOKEN_HEARTBEAT_SECONDS 可调）", heartbeat_interval)
     threading.Thread(
         target=heartbeat_loop, args=(cloud, state, bridge, stop_event, heartbeat_interval),
@@ -533,6 +682,13 @@ def main() -> None:
             else:
                 local.publish(f"homy/cmd/{hvac}", {"temp_set": "26.5", "switch": True})
                 logger.info("probe：已注入本地命令（dry-run），观察 set 构造日志")
+                local.publish(f"homy/cmd/{hvac}/hvac_ac", '{"hvac_mode":"cool","temperature":26.5}')
+                local.publish(f"homy/cmd/{hvac}/hvac_ac", '{"hvac_mode":"off"}')
+                local.publish(f"homy/cmd/{hvac}/hvac_heat", '{"hvac_mode":"heat","temperature":24.0}')
+                local.publish(f"homy/cmd/{hvac}/hvac_heat", '{"hvac_mode":"off"}')
+                logger.info("probe：已注入 climate 平台命令（dry-run），观察翻译日志")
+            bridge.dry_run = True
+            bridge.publish_discovery()
             time.sleep(35)
         else:
             while True:

@@ -164,6 +164,19 @@ def encrypt_password(plain: str) -> str:
     return base64.b64encode(enc).decode()
 
 
+def _is_app_shape_token(token: str) -> bool:
+    """APP 形态 token：3 段 JWT，header 含 "typ":"JWT"（降级 token header 只有 {alg}）。"""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    try:
+        padded = parts[0] + "=" * (-len(parts[0]) % 4)
+        header = json.loads(base64.urlsafe_b64decode(padded))
+    except (ValueError, json.JSONDecodeError):
+        return False
+    return header.get("typ") == "JWT"
+
+
 # ============================================================
 # 客户端
 # ============================================================
@@ -208,6 +221,15 @@ class HomyCloudClient:
         data = self._request(
             "POST", "/app-api/user/center/accountLogin", body, with_token=False
         )
+        # 降级响应实锤（2026-09-22 九章）：data 多出 access_token/refresh_token/token_type/expires_in，
+        # token 是 253 字符、JWT header 只有 {alg}（正常 580 字符、header 含 "typ":"JWT"），
+        # 该 token 打 /family/simple 一律 500。检测到即拒绝缓存并报错，由上层重试。
+        if "access_token" in data or not _is_app_shape_token(data["token"]):
+            logger.error(
+                "登录返回降级 token，拒绝缓存 %s",
+                json.dumps(data, ensure_ascii=False),
+            )
+            raise HomyCloudError("登录返回降级 token（JWT header 缺 typ 或含 access_token 字段），已拒绝缓存")
         self.token = data["token"]
         self.user_secret = data["userSecret"]
         self._token_expires_at = time.time() + int(data.get("expiresIn", TOKEN_TTL_SECONDS))
@@ -327,13 +349,39 @@ class HomyCloudClient:
         headers["timestamp"] = ts
         headers["signature"] = make_signature(method, path, body or "", ts)
 
-        logger.debug("%s %s", method, path)
+        try:
+            body_json = json.loads(body) if body else None
+        except ValueError:
+            body_json = body
+        logger.info("HTTP 请求 %s", self._json_body({
+            "method": method,
+            "url": f"{BASE_URL}{path}",
+            "headers": headers,
+            "body": body_json,
+        }))
+        t0 = time.monotonic()
         resp = self._http.request(
             method,
             path,
             content=body.encode("utf-8") if body is not None else None,
             headers=headers,
         )
+        try:
+            resp_body_json = resp.json()
+        except ValueError:
+            resp_body_json = resp.text
+        logger.info("HTTP 响应 %s", self._json_body({
+            "method": method,
+            "url": f"{BASE_URL}{path}",
+            "status": resp.status_code,
+            "elapsed_ms": round((time.monotonic() - t0) * 1000),
+            "body": resp_body_json,
+        }))
+        # HTTP 401 = token 已被服务端作废（本地有效期未必过期），等同业务码鉴权失败
+        if resp.status_code == 401 and allow_relogin and with_token:
+            logger.warning("HTTP 401，token 失效，自动重登后重试")
+            self.login(force=True)
+            return self._request(method, path, body, with_token, allow_relogin=False)
         resp.raise_for_status()
 
         try:
@@ -363,7 +411,11 @@ class HomyCloudClient:
             return
         if raw.get("phone") != self.phone:
             return
-        self.token = raw.get("token")
+        token = raw.get("token")
+        if not token or not _is_app_shape_token(token):
+            logger.warning("token 文件中是非 APP 形态 token，丢弃缓存等待重登")
+            return
+        self.token = token
         self.user_secret = raw.get("user_secret")
         self.user_uuid = raw.get("user_uuid")
         self._token_expires_at = float(raw.get("expires_at", 0))

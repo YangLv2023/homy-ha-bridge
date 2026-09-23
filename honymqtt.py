@@ -3,7 +3,8 @@
 协议常量单点维护在 homycloud.py（铁律 12）；本文件只管连接生命周期与消息分发。
 关键约束（docs/宏云APP接口文档.md 第五部分）：
 - 同 clientId 全局单会话：桥接在线时手机 APP 登录会把桥接踢下线（disconnect rc 变化）
-- 高频重连触发 broker 软限流 rc=5：曾成功建连后的 rc=5 按软限流处理，退避 5 分钟
+- rc=5 实测成因：clientId 不精确匹配 / 凭据算错 / 同 clientId 会话被其他客户端占用互踢；
+  曾成功建连后的 rc=5 延长退避（2026-09-21 用户定案：360s 起 + 随机抖动）
 - clientId 必须精确 homyapp_{family.clientId}，改动即 rc=5
 
 用法：
@@ -31,18 +32,27 @@ logger = logging.getLogger("honymqtt")
 # 系统信任库不含该 CA，直接默认校验会 CERTIFICATE_VERIFY_FAILED。
 BUNDLED_CA = Path(__file__).parent / "certs" / "homycloudCA.pem"
 
-BACKOFF_INITIAL = 5.0
-BACKOFF_MAX = 300.0
-# S7-a 实测：互踢高频重连触发 broker 软限流，退避数分钟才能恢复。
-# 2026-09-21 用户定案：退避 360s 起 + 随机抖动，避免每次卡在同一个固定点
+# 2026-09-22 用户定案：阶梯 5/10/20/60，之后 ×2（120→240→480…），封顶 900s
+BACKOFF_STEPS = (5.0, 10.0, 20.0, 60.0)
+BACKOFF_MAX = 900.0
+# 互踢窗口内重连频繁，2026-09-21 用户定案：退避 360s 起 + 随机抖动，避免每次卡在同一个固定点
 THROTTLE_BACKOFF = 360.0
 
+
+def next_backoff(attempt: int) -> float:
+    """第 attempt 次重连（0 起）应等待的秒数。"""
+    if attempt < len(BACKOFF_STEPS):
+        return BACKOFF_STEPS[attempt]
+    return min(BACKOFF_STEPS[-1] * 2 ** (attempt - len(BACKOFF_STEPS) + 1), BACKOFF_MAX)
+
+
 CONNACK_ERRORS = {
+    0: "连接成功",
     1: "协议版本不支持",
     2: "clientId 被拒",
     3: "服务端不可用",
     4: "用户名/密码错误",
-    5: "未授权（clientId 错配，或曾频繁重连触发软限流）",
+    5: "未授权（clientId 错配 / 凭据算错 / 同 clientId 会话被占用互踢）",
 }
 
 # 控制下行（S7-a 实抓定案，docs/宏云APP接口文档.md 5.5）：
@@ -77,6 +87,8 @@ class HomyMqttClient:
 
     - on_message(topic, payload)：payload 已尽力 JSON 解析（失败则传原始 bytes）
     - on_disconnect()：断线通知（含被 APP 接管互踢），供上层决定是否让位/告警
+    - creds_provider()：每次 CONNECT 前重算凭据。username 含 ts_ms，APP 是每次连接现取的，
+      静态 creds 在长退避后拿的是几分钟前的旧 ts
     - start() 非阻塞；wait_ready() 等首次 CONNACK 成功
     """
 
@@ -86,8 +98,10 @@ class HomyMqttClient:
         on_message=None,
         on_disconnect=None,
         ca_certs: str | Path | None = BUNDLED_CA,
+        creds_provider=None,
     ):
         self._creds = creds
+        self._creds_provider = creds_provider
         self._ca_certs = str(ca_certs) if ca_certs is not None else None
         self._on_message_cb = on_message
         self._on_disconnect_cb = on_disconnect
@@ -95,7 +109,7 @@ class HomyMqttClient:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._connected = threading.Event()
-        self._backoff = BACKOFF_INITIAL
+        self._attempts = 0
         self._ever_connected = False
 
     # ---------- 对外接口 ----------
@@ -154,11 +168,11 @@ class HomyMqttClient:
             if self._stop.is_set():
                 break
 
-            delay = self._backoff
-            self._backoff = min(self._backoff * 2, BACKOFF_MAX)
+            delay = next_backoff(self._attempts)
+            self._attempts += 1
             if getattr(self, "_last_connack_rc", 0) == 5 and self._ever_connected:
                 delay = max(delay, THROTTLE_BACKOFF)
-                logger.warning("rc=5 且曾成功建连 → 按软限流处理，退避 %.0fs", delay)
+                logger.warning("rc=5 且曾成功建连 → 延长退避 %.0fs", delay)
             delay *= random.uniform(0.9, 1.1)  # 抖动，避免固定周期撞限流窗口
             logger.info("%.0fs 后重连", delay)
             if self._on_disconnect_cb:
@@ -169,6 +183,11 @@ class HomyMqttClient:
             self._stop.wait(delay)
 
     def _connect_and_loop(self) -> None:
+        if self._creds_provider is not None:
+            try:
+                self._creds = self._creds_provider()
+            except Exception as e:
+                logger.warning("重算 MQTT 凭据失败，沿用上一份: %s", e)
         c = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION1,
             client_id=self._creds["client_id"],
@@ -182,10 +201,16 @@ class HomyMqttClient:
         c.on_subscribe = self._on_subscribe
         self._client = c
 
-        logger.info(
-            "连接 %s:%s (clientId=%s)",
-            self._creds["host"], self._creds["port"], self._creds["client_id"],
-        )
+        logger.info("MQTT CONNECT %s", json.dumps({
+            "host": self._creds["host"],
+            "port": self._creds["port"],
+            "keepalive": self._creds["keepalive"],
+            "clean_session": True,
+            "clientId": self._creds["client_id"],
+            "username": self._creds["username"],
+            "password": self._creds["password"],
+            "ca": str(self._ca_certs),
+        }, ensure_ascii=False))
         c.connect(self._creds["host"], self._creds["port"], self._creds["keepalive"])
         c.loop_forever()  # 断开后返回，由 _run 决定退避重连
 
@@ -193,19 +218,41 @@ class HomyMqttClient:
     def _on_connect(self, client, userdata, flags, rc):
         self._last_connack_rc = rc
         if rc != 0:
-            logger.error("CONNACK 失败 rc=%s (%s)", rc, CONNACK_ERRORS.get(rc, "未知"))
+            logger.error("MQTT CONNACK %s", json.dumps({
+                "rc": rc,
+                "meaning": CONNACK_ERRORS.get(rc, "未知"),
+                "clientId": self._creds["client_id"],
+                "username": self._creds["username"],
+                "password": self._creds["password"],
+            }, ensure_ascii=False))
             try:
                 client.disconnect()  # 让 loop_forever 返回，走退避
             except Exception:
                 pass
             return
-        logger.info("MQTT 已连接（CONNACK rc=0）")
+        logger.info("MQTT CONNACK %s", json.dumps({"rc": 0}))
         self._ever_connected = True
-        self._backoff = BACKOFF_INITIAL
+        self._attempts = 0
+        logger.info("MQTT SUBSCRIBE %s", json.dumps({
+            "topic": self._creds["subscribe_topic"],
+            "qos": 0,
+        }, ensure_ascii=False))
         client.subscribe(self._creds["subscribe_topic"], qos=0)
 
     def _on_subscribe(self, client, userdata, mid, granted_qos):
-        logger.info("订阅成功 topic=%s qos=%s", self._creds["subscribe_topic"], granted_qos)
+        topic = self._creds["subscribe_topic"]
+        rejected = any(q == 0x80 for q in granted_qos)
+        logger.info("MQTT SUBACK %s", json.dumps({
+            "topic": topic,
+            "granted_qos": list(granted_qos),
+            "rejected": rejected,
+        }, ensure_ascii=False))
+        if rejected:  # SUBACK 0x80 = 订阅被拒
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            return
         self._connected.set()
 
     def _on_disconnect(self, client, userdata, rc):
