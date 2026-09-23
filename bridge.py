@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -56,7 +57,7 @@ TOKEN_HEARTBEAT_SECONDS_DEFAULT = 600.0
 CLOUD_RETRY_SECONDS_DEFAULT = 300.0
 
 # 项目命名定案（2026-09-20 用户拍板）：与 APP houseName 不一致处以 devices.json 为准
-# devices.json 含真实设备 ID（随仓库上传，作克隆模板），缺失时回退用 APP 返回的房间/设备名
+# devices.json 缺失时回退用 APP 返回的房间/设备名
 def load_devices_config() -> dict:
     p = Path(__file__).parent / "devices.json"
     if not p.exists():
@@ -64,8 +65,92 @@ def load_devices_config() -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+class DevicesConfigError(Exception):
+    """devices.json 名字匹配失败（未命中/重名未加 @N/@N 越界）。"""
+
+
 DEVICES_CONFIG = load_devices_config()
+# devices.json 用纯名字做 key（2026-09-23 用户定案：人不填设备 ID），启动时经
+# resolve_device_ids() 按云端设备清单翻译成 ID；找不到/重名歧义 = DevicesConfigError。
 NAME_OVERRIDES = DEVICES_CONFIG.get("name_overrides", {})
+CHANNELS = DEVICES_CONFIG.get("channels", {})
+GATEWAY_DEVICE_NAME = DEVICES_CONFIG.get("gateway_device_name", "")
+PROBE_HVAC_DEVICE_NAME = DEVICES_CONFIG.get("probe_hvac_device_name", "")
+GATEWAY_DEVICE_ID = ""
+PROBE_HVAC_DEVICE_ID = ""
+
+_NAME_KEY_RE = re.compile(r"^(?P<base>.+?)(?:@(?P<idx>\d+))?$")
+
+
+def _parse_name_key(key: str) -> tuple[str | None, str, int | None]:
+    """'房间/设备名@N' → (房间或 None, 设备名, N 或 None)。"""
+    m = _NAME_KEY_RE.match(key.strip())
+    base, idx = m.group("base"), m.group("idx")
+    if "/" in base:
+        room, _, name = base.partition("/")
+        return room, name, int(idx) if idx else None
+    return None, base, int(idx) if idx else None
+
+
+def resolve_device_ids(devices: list[dict]) -> None:
+    """把 devices.json 的名字 key 翻译成 deviceId（写回模块级 NAME_OVERRIDES/CHANNELS 等）。
+
+    key 格式：`设备名` 或 `房间/设备名`；同名多台时加 `@N`（N=APP 房间内排序 deviceHouseSort，
+    1 起）。未命中/重名未加 @N/@N 越界 → DevicesConfigError（启动重试循环按
+    CLOUD_RETRY_SECONDS 间隔报明细，不会重启风暴）。
+    """
+    def lookup(key: str, where: str) -> str:
+        room, name, idx = _parse_name_key(key)
+        cands = [
+            d for d in devices
+            if d.get("deviceName") == name
+            and (room is None or d.get("houseName") == room)
+        ]
+        if not cands:
+            have = "; ".join(
+                f"{d.get('houseName')}/{d.get('deviceName')}" for d in devices
+            )
+            raise DevicesConfigError(
+                f"devices.json {where} 的 {key!r} 未匹配到任何设备（云端现有: {have}）"
+            )
+        if len(cands) > 1:
+            if idx is None:
+                detail = "; ".join(
+                    f"@{d.get('deviceHouseSort')}={d['deviceId'][:8]}" for d in cands
+                )
+                raise DevicesConfigError(
+                    f"devices.json {where} 的 {key!r} 命中 {len(cands)} 台，须加 @N 消歧: {detail}"
+                )
+            pick = [d for d in cands if d.get("deviceHouseSort") == idx]
+            if not pick:
+                sorts = ",".join(str(d.get("deviceHouseSort")) for d in cands)
+                raise DevicesConfigError(
+                    f"devices.json {where} 的 {key!r} 指定 @{idx}，但该房间内序号只有: {sorts}"
+                )
+            return pick[0]["deviceId"]
+        return cands[0]["deviceId"]
+
+    global NAME_OVERRIDES, CHANNELS, GATEWAY_DEVICE_ID, PROBE_HVAC_DEVICE_ID
+    mapping: list[str] = []
+
+    def conv(key: str, where: str) -> str:
+        did = lookup(key, where)
+        mapping.append(f"{key}→{did[:8]}")
+        return did
+
+    NAME_OVERRIDES = {conv(k, "name_overrides"): ov for k, ov in NAME_OVERRIDES.items()}
+    resolved_channels: dict[str, dict] = {}
+    for k, ch in CHANNELS.items():
+        ch = dict(ch)
+        if "_linked_with" in ch:
+            ch["_linked_with"] = conv(ch["_linked_with"], f"channels[{k}]._linked_with")
+        resolved_channels[conv(k, "channels")] = ch
+    CHANNELS = resolved_channels
+    if GATEWAY_DEVICE_NAME:
+        GATEWAY_DEVICE_ID = conv(GATEWAY_DEVICE_NAME, "gateway_device_name")
+    if PROBE_HVAC_DEVICE_NAME:
+        PROBE_HVAC_DEVICE_ID = conv(PROBE_HVAC_DEVICE_NAME, "probe_hvac_device_name")
+    logger.info("devices.json 名字匹配: %s", ", ".join(mapping))
 
 
 ENV_KEYS = ("PHONE", "PASSWORD", "FAMILY_NAME",
@@ -248,6 +333,7 @@ class BridgeState:
 def build_initial_snapshot(cloud: HomyCloudClient, state: BridgeState, family_uuid: str) -> None:
     rooms = {r["uuid"]: r["name"] for r in (cloud.list_rooms(family_uuid) or [])}
     devices = cloud.list_devices(family_uuid) or []
+    resolve_device_ids(devices)
     online = cloud.get_devices_online(family_uuid) or []
     if isinstance(online, dict):
         online = online.get("deviceIds") or []
@@ -555,9 +641,8 @@ class Bridge:
 
     # ---------- HA discovery（S8-2）----------
     def publish_discovery(self) -> None:
-        channels = DEVICES_CONFIG.get("channels", {})
         metas = {did: (self.state.meta(did) or {}) for did in self.state.device_ids()}
-        configs = hadiscovery.build_configs(metas, channels)
+        configs = hadiscovery.build_configs(metas, CHANNELS)
         if self.dry_run:
             by_platform: dict[str, int] = {}
             for topic, _ in configs:
@@ -608,7 +693,7 @@ def main() -> None:
 
             build_initial_snapshot(cloud, state, family_uuid)
             break
-        except (HomyCloudError, httpx.HTTPError, OSError) as e:
+        except (HomyCloudError, httpx.HTTPError, OSError, DevicesConfigError) as e:
             logger.error(
                 "云端启动阶段失败（%s: %s）→ %.0fs 后原地重试，不退出",
                 type(e).__name__, e, retry_seconds,
@@ -667,7 +752,7 @@ def main() -> None:
             time.sleep(3)
             fake = {
                 "code": 0,
-                "deviceId": DEVICES_CONFIG.get("gateway_device_id", ""),
+                "deviceId": GATEWAY_DEVICE_ID,
                 "data": {"ip_addr": {"time": int(time.time() * 1000), "value": f"10.0.{int(time.time()) % 256}.{int(time.time() * 10) % 256}"}},
             }
             bridge.on_cloud_message(
@@ -676,9 +761,9 @@ def main() -> None:
             logger.info("probe：已注入伪造 view，观察上方 view 变更日志")
             # S7-6 自检：本地命令 → set 构造（dry-run，不真正下发云端）
             bridge.dry_run = True
-            hvac = DEVICES_CONFIG.get("probe_hvac_device_id", "")
+            hvac = PROBE_HVAC_DEVICE_ID
             if not hvac:
-                logger.warning("probe：devices.json 未配置 probe_hvac_device_id，跳过命令注入")
+                logger.warning("probe：devices.json 未配置 probe_hvac_device_name，跳过命令注入")
             else:
                 local.publish(f"homy/cmd/{hvac}", {"temp_set": "26.5", "switch": True})
                 logger.info("probe：已注入本地命令（dry-run），观察 set 构造日志")
