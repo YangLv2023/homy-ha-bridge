@@ -188,19 +188,23 @@ def build_configs(meta_by_did: dict[str, dict], channels: dict) -> list[tuple[st
             area = entry.get("area") or room
             light_groups.setdefault((did, area), []).append((field, entry))
 
-    # 灯组设备：同 (面板, 区域) 多实体 → "{区域}灯组"；单实体 → "{区域}灯具"
+    # 灯组设备：同 (面板, 区域) 多实体 → "{区域}灯组"；单实体 → "{区域}灯具"；
+    # fan 类实体（凉霸等）不进灯组，每台单独成设备，设备名=实体名
     for (did, area), entries in light_groups.items():
         model = "CLA0001 智控面板"
-        if len(entries) > 1:
-            dev = _dev(f"homy_g_{did}_{area}", f"{area}灯组", area, model)
-        else:
-            field, entry = entries[0]
-            dev = _dev(f"homy_g_{did}_{area}", f"{area}灯具", area, model)
-        for field, entry in entries:
-            name = entry.get("name") or f"{area}{field}"
-            if entry.get("platform") == "fan":
-                configs.append(_fan_bool_config(did, field, name, dev))
+        lights = [(f, e) for f, e in entries if e.get("platform") != "fan"]
+        fans = [(f, e) for f, e in entries if e.get("platform") == "fan"]
+        if lights:
+            if len(lights) > 1:
+                dev = _dev(f"homy_g_{did}_{area}", f"{area}灯组", area, model)
             else:
+                dev = _dev(f"homy_g_{did}_{area}", f"{area}灯具", area, model)
+            for field, entry in lights:
+                name = entry.get("name") or f"{area}{field}"
                 configs.append(_light_config(did, field, name, dev))
+        for field, entry in fans:
+            name = entry.get("name") or f"{area}{field}"
+            fdev = _dev(f"homy_g_{did}_{area}_{field}", name, area, model)
+            configs.append(_fan_bool_config(did, field, name, fdev))
 
     return configs

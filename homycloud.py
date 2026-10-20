@@ -165,16 +165,23 @@ def encrypt_password(plain: str) -> str:
 
 
 def _is_app_shape_token(token: str) -> bool:
-    """APP 形态 token：3 段 JWT，header 含 "typ":"JWT"（降级 token header 只有 {alg}）。"""
+    """合法 token：3 段 JWT 且 header 可解析。两种形态都接受：
+
+    - 12h 形态（2026-09 抓包）：header 含 "typ":"JWT"，payload 含 sub/aud/loginToken
+    - 30 天形态（2026-10-17 实测）：header 只有 {alg}，payload 为 userUuid/terminal 直挂，
+      响应多带 access_token 等空壳字段。旧结论"该形态不可用（500/9999）"已作废——
+      2026-10-17 实测该 token 打 family/simple / getUserData 均 0000，
+      且 MQTT 8883 CONNACK rc=0 + SUBACK 全链路可用。
+    """
     parts = token.split(".")
-    if len(parts) != 3:
+    if len(parts) != 3 or not all(parts):
         return False
     try:
         padded = parts[0] + "=" * (-len(parts[0]) % 4)
         header = json.loads(base64.urlsafe_b64decode(padded))
     except (ValueError, json.JSONDecodeError):
         return False
-    return header.get("typ") == "JWT"
+    return bool(header.get("alg"))
 
 
 # ============================================================
@@ -221,15 +228,15 @@ class HomyCloudClient:
         data = self._request(
             "POST", "/app-api/user/center/accountLogin", body, with_token=False
         )
-        # 降级响应实锤（2026-09-22 九章）：data 多出 access_token/refresh_token/token_type/expires_in，
-        # token 是 253 字符、JWT header 只有 {alg}（正常 580 字符、header 含 "typ":"JWT"），
-        # 该 token 打 /family/simple 一律 500。检测到即拒绝缓存并报错，由上层重试。
-        if "access_token" in data or not _is_app_shape_token(data["token"]):
+        # token 形态校验（2026-10-17 放宽）：12h 与 30 天两种 JWT 形态均可正常使用，
+        # 只拒绝连 3 段 JWT 都不是的坏响应（2026-09-23 的"降级 token 拦截"已撤销，
+        # 当时"该形态导致 family/simple 500/9999"经 2026-10-17 复测不成立）。
+        if not _is_app_shape_token(data["token"]):
             logger.error(
-                "登录返回降级 token，拒绝缓存 %s",
+                "登录返回异常 token（非 3 段 JWT），拒绝缓存 %s",
                 json.dumps(data, ensure_ascii=False),
             )
-            raise HomyCloudError("登录返回降级 token（JWT header 缺 typ 或含 access_token 字段），已拒绝缓存")
+            raise HomyCloudError("登录返回异常 token（非 3 段 JWT），已拒绝缓存")
         self.token = data["token"]
         self.user_secret = data["userSecret"]
         self._token_expires_at = time.time() + int(data.get("expiresIn", TOKEN_TTL_SECONDS))
